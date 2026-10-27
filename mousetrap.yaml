@@ -1,0 +1,221 @@
+esphome:
+  name: mousetrap
+  friendly_name: MouseTrap
+  on_boot:
+    priority: -10
+    then:
+      - output.set_level:
+          id: servo_output
+          level: !lambda 'return id(servo_stop_val);'
+      - output.turn_on: built_in_led
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+globals:
+  - id: mouse_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: servo_stop_val
+    type: float
+    restore_value: yes
+    initial_value: '0.075'
+
+  # 0 = IDLE
+  # 1 = RUNNING
+  - id: trap_state
+    type: int
+    initial_value: '0'
+
+  # 0 = idle
+  # 1 = running, waiting for switch OFF (because it started latched ON)
+  # 2 = running, armed to stop on next switch ON
+  - id: run_phase
+    type: int
+    initial_value: '0'
+
+esp32_touch:
+  setup_mode: False
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+output:
+  - platform: gpio
+    id: built_in_led
+    pin: GPIO2
+    inverted: true
+
+  - platform: ledc
+    id: servo_output
+    pin: GPIO15
+    frequency: 50Hz
+
+script:
+  - id: start_cycle
+    mode: single
+    then:
+      - output.turn_off: built_in_led
+      - globals.set: { id: trap_state, value: '1' }
+
+      # Decide phase based on current switch state (latched ON is normal after a stop)
+      - if:
+          condition:
+            binary_sensor.is_on: limit_switch
+          then:
+            - globals.set: { id: run_phase, value: '1' }
+            - logger.log: "START: switch is ON (latched) -> waiting for OFF then ON"
+          else:
+            - globals.set: { id: run_phase, value: '2' }
+            - logger.log: "START: switch is OFF -> armed to stop on ON"
+
+      # Start servo (one direction)
+      - output.set_level:
+          id: servo_output
+          level: !lambda |-
+            float v = id(servo_stop_val) + 0.05;
+            if (v > 0.12) v = 0.12;
+            return v;
+
+      # Optional safety stop (prevents runaway if switch fails)
+      - delay: 10s
+      - if:
+          condition:
+            lambda: 'return id(trap_state) == 1;'
+          then:
+            - logger.log: "SAFETY TIMEOUT -> STOP"
+            - script.execute: stop_cycle
+
+  - id: stop_cycle
+    mode: single
+    then:
+      - output.set_level:
+          id: servo_output
+          level: !lambda 'return id(servo_stop_val);'
+      - globals.set: { id: trap_state, value: '0' }
+      - globals.set: { id: run_phase, value: '0' }
+      - globals.set:
+          id: mouse_count
+          value: !lambda 'return id(mouse_count) + 1;'
+      - output.turn_on: built_in_led
+      - logger.log: "STOPPED. Waiting for next touch."
+
+# --- INPUTS ---
+binary_sensor:
+  # TOUCH SENSOR
+  - platform: esp32_touch
+    name: "Mouse Trigger"
+    id: mouse_touch
+    pin: GPIO4
+    threshold: 200
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(trap_state) == 0;'
+          then:
+            - logger.log: "TOUCH -> START CYCLE"
+            - script.execute: start_cycle
+          else:
+            - logger.log: "Touch ignored (already running)"
+
+  # LIMIT SWITCH (latched ON after stop)
+  - platform: gpio
+    name: "Trap Limit Switch"
+    id: limit_switch
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+      inverted: true
+
+    # Keep these LOW for speed. Increase slightly if you see bounce.
+    filters:
+      - delayed_on: 1ms
+      - delayed_off: 1ms
+
+    # If we started with latched ON, we must see OFF first before we arm the stop
+    on_release:
+      - if:
+          condition:
+            lambda: 'return id(trap_state) == 1 && id(run_phase) == 1;'
+          then:
+            - globals.set: { id: run_phase, value: '2' }
+            - logger.log: "Switch went OFF -> armed to stop on next ON"
+
+    # Stop immediately on the next ON edge (only when armed)
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(trap_state) == 1 && id(run_phase) == 2;'
+          then:
+            - logger.log: "LIMIT ON (hit) -> STOP NOW"
+            - script.execute: stop_cycle
+
+sensor:
+  - platform: template
+    name: "Mice Caught"
+    id: mice_caught_sensor
+    icon: "mdi:counter"
+    lambda: 'return id(mouse_count);'
+    update_interval: 1s
+
+# --- CALIBRATION ---
+number:
+  - platform: template
+    name: "Servo Stop Calibration"
+    min_value: 0
+    max_value: 100
+    step: 0.1
+    initial_value: 50
+    optimistic: true
+    mode: slider
+    on_value:
+      then:
+        - lambda: |-
+            float duty = 0.03 + (x / 100.0) * (0.12 - 0.03);
+            id(servo_stop_val) = duty;
+            id(servo_output).set_level(duty);
+
+switch:
+  - platform: template
+    name: "Manual Trigger (Test)"
+    turn_on_action:
+      - if:
+          condition:
+            lambda: 'return id(trap_state) == 0;'
+          then:
+            - logger.log: "MANUAL -> START CYCLE"
+            - script.execute: start_cycle
+          else:
+            - logger.log: "Manual ignored (already running)"
+    turn_off_action:
+      # Emergency stop
+      - script.stop: start_cycle
+      - output.set_level:
+          id: servo_output
+          level: !lambda 'return id(servo_stop_val);'
+      - globals.set: { id: trap_state, value: '0' }
+      - globals.set: { id: run_phase, value: '0' }
+      - output.turn_on: built_in_led
+
+button:
+  - platform: template
+    name: "Reset Counter"
+    on_press:
+      - globals.set: { id: mouse_count, value: '0' }
